@@ -1,0 +1,147 @@
+name: Build PS4 FastDrop Stub PKG
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'ps4_fastdrop/**'
+      - '.github/workflows/build-ps4-pkg.yml'
+  workflow_dispatch:
+
+jobs:
+  build-ps4-pkg:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install LLVM (clang, lld), Python PIL and .NET runtime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang \
+            lld \
+            python3 \
+            python3-pil \
+            unzip \
+            curl \
+            ca-certificates
+
+      - name: Setup OpenOrbis PS4 Toolchain
+        run: |
+          set -euo pipefail
+          mkdir -p /opt/openorbis
+          ARCHIVE_URL="$(curl -fsSL https://api.github.com/repos/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest \
+            | python3 -c "import sys, json; data = json.load(sys.stdin); assets = [a['browser_download_url'] for a in data.get('assets', []) if a['name'].endswith('.zip')]; print(assets[0] if assets else '')")"
+
+          if [ -z "$ARCHIVE_URL" ]; then
+            echo "Could not find OpenOrbis release zip asset automatically."
+            exit 1
+          fi
+
+          curl -fsSL "$ARCHIVE_URL" -o /tmp/openorbis.zip
+          unzip -q /tmp/openorbis.zip -d /opt/openorbis
+
+          TOOLCHAIN_DIR="$(find /opt/openorbis -maxdepth 2 -type d -name "include" -printf '%h\n' | head -n 1)"
+          if [ -z "$TOOLCHAIN_DIR" ]; then
+            TOOLCHAIN_DIR="/opt/openorbis"
+          fi
+
+          echo "OO_PS4_TOOLCHAIN=$TOOLCHAIN_DIR" >> "$GITHUB_ENV"
+          echo "$TOOLCHAIN_DIR/bin/linux/x86_64" >> "$GITHUB_PATH"
+
+      - name: Prepare PS4 project files and sce_sys assets
+        run: |
+          set -euo pipefail
+          cd ps4_fastdrop
+          mkdir -p pkg_dir/sce_sys build
+
+          if [ ! -f pkg_dir/sce_sys/icon0.png ]; then
+            python3 - << 'PYEOF'
+          from PIL import Image, ImageDraw
+          img = Image.new("RGBA", (512, 512), (7, 9, 11, 255))
+          draw = ImageDraw.Draw(img)
+          draw.rounded_rectangle([36, 36, 476, 476], radius=64, fill=(12, 20, 16, 255), outline=(46, 204, 113, 255), width=8)
+          draw.rounded_rectangle([96, 150, 416, 362], radius=28, fill=(16, 27, 21, 255), outline=(123, 255, 156, 255), width=4)
+          draw.text((132, 232), "FASTDROP PS4", fill=(123, 255, 156, 255))
+          img.save("pkg_dir/sce_sys/icon0.png")
+          PYEOF
+          fi
+
+      - name: Compile ELF and convert to eboot.bin (fself)
+        run: |
+          set -euo pipefail
+          cd ps4_fastdrop
+
+          clang -target x86_64-scei-freebsd \
+            -isysroot "$OO_PS4_TOOLCHAIN" \
+            -isystem "$OO_PS4_TOOLCHAIN/include" \
+            -I"$OO_PS4_TOOLCHAIN/include/orbis" \
+            -O2 -Wall -Wextra \
+            -c source/main.c -o build/main.o
+
+          ld.lld -target x86_64-scei-freebsd \
+            --sysroot="$OO_PS4_TOOLCHAIN" \
+            -L"$OO_PS4_TOOLCHAIN/lib" \
+            -lSceSysmodule -lSceUserService -lScePad -lc -lkernel \
+            build/main.o -o build/FastDropPS4.elf
+
+          if command -v elf-to-oelf >/dev/null 2>&1; then
+            elf-to-oelf build/FastDropPS4.elf build/FastDropPS4.oelf
+            SELF_INPUT="build/FastDropPS4.oelf"
+          else
+            SELF_INPUT="build/FastDropPS4.elf"
+          fi
+
+          create-fself -in "$SELF_INPUT" --out build/FastDropPS4.debug.oelf --eboot pkg_dir/eboot.bin
+
+      - name: Build param.sfo, GP4 manifest and PS4 PKG
+        run: |
+          set -euo pipefail
+          cd ps4_fastdrop
+
+          PKG_TOOL="$(command -v create-pkg || find /opt/openorbis -name 'create-pkg*' -type f | head -n 1 || true)"
+          SFO_TOOL="$(command -v pkg_sfo || command -v create-sfo || find /opt/openorbis -name '*sfo*' -type f | head -n 1 || true)"
+
+          if [ -z "$PKG_TOOL" ]; then
+            echo "PKG builder binary not found in OpenOrbis toolchain."
+            ls -laR "$OO_PS4_TOOLCHAIN/bin" || true
+            exit 1
+          fi
+
+          if [ -n "$SFO_TOOL" ] && [ ! -f pkg_dir/sce_sys/param.sfo ]; then
+            "$SFO_TOOL" --title "FastDrop PS4" --title-id "FSDROP001" -s APP_TYPE=full -s CATEGORY=ac -o pkg_dir/sce_sys/param.sfo || true
+          fi
+
+          if command -v create-gp4 >/dev/null 2>&1; then
+            create-gp4 \
+              --content-id="UP0001-FSDROP001_00-FASTDROPPS400001" \
+              --files="eboot.bin sce_sys/param.sfo sce_sys/icon0.png" \
+              --out FastDropPS4.gp4
+          else
+            cat << 'EOF' > FastDropPS4.gp4
+<?xml version="1.0" encoding="utf-8"?>
+<psproject fmt="gp4" version="1000">
+  <volume>
+    <volume_type>pkg_ps4_app</volume_type>
+    <volume_id>FSDROP001-FASTDROP</volume_id>
+    <package_content_id>UP0001-FSDROP001_00-FASTDROPPS400001</package_content_id>
+    <app_type>full</app_type>
+  </volume>
+  <files>
+    <file orig_path="pkg_dir/eboot.bin" targ_path="eboot.bin"/>
+    <file orig_path="pkg_dir/sce_sys/param.sfo" targ_path="sce_sys/param.sfo"/>
+    <file orig_path="pkg_dir/sce_sys/icon0.png" targ_path="sce_sys/icon0.png"/>
+  </files>
+</psproject>
+EOF
+          fi
+
+          "$PKG_TOOL" --out FastDropPS4_stub.pkg FastDropPS4.gp4
+
+      - name: Upload PS4 PKG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FastDrop-PS4-stub-pkg
+          path: ps4_fastdrop/FastDropPS4_stub.pkg
